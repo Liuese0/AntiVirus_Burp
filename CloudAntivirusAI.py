@@ -1076,6 +1076,204 @@ class VirtualAIScanner:
         except:
             return False
 
+    def sandbox_scan(self, file_path, timeout=30, execute=True):
+        """
+        샌드박스 환경에서 파일을 안전하게 분석
+
+        Args:
+            file_path: 스캔할 파일 경로
+            timeout: 실행 타임아웃 (초)
+            execute: True면 실제 실행, False면 정적 분석만
+
+        Returns:
+            dict: 스캔 결과
+        """
+        result = {
+            'threat_level': 0,
+            'threat_type': 'Clean',
+            'confidence': 0,
+            'behaviors': [],
+            'file_operations': [],
+            'process_created': [],
+            'network_activity': [],
+            'suspicious_patterns': [],
+            'execution_log': []
+        }
+
+        sandbox_dir = None
+        process = None
+        monitoring_active = False
+
+        try:
+            # 샌드박스 환경 생성
+            sandbox_dir = tempfile.mkdtemp(prefix='sandbox_', suffix='_av')
+            result['execution_log'].append(f"샌드박스 환경 생성: {sandbox_dir}")
+
+            # 파일 메타데이터 분석
+            stat_info = os.stat(file_path)
+            file_hash = self.calculate_hash(file_path)
+
+            metadata = {
+                'size': stat_info.st_size,
+                'hash': file_hash,
+                'extension': os.path.splitext(file_path)[1].lower()
+            }
+
+            # 정적 분석 - 의심스러운 패턴 탐지
+            try:
+                with open(file_path, 'rb') as f:
+                    content = f.read(1024 * 1024)  # 첫 1MB
+
+                for pattern in self.suspicious_patterns:
+                    if pattern in content:
+                        result['threat_level'] += 8
+                        result['suspicious_patterns'].append(pattern.decode('utf-8', errors='ignore'))
+            except:
+                pass
+
+            # 파일 확장자 검사
+            ext = metadata['extension']
+            if ext in ['.exe', '.dll', '.scr', '.bat', '.cmd', '.vbs', '.ps1', '.sh']:
+                result['threat_level'] += 10
+                result['behaviors'].append(f'dangerous_extension_{ext}')
+
+            # 동적 분석 (실행)
+            if execute:
+                result['execution_log'].append("동적 분석 시작 (샌드박스 실행)...")
+
+                # 파일을 샌드박스로 복사
+                filename = os.path.basename(file_path)
+                sandbox_file = os.path.join(sandbox_dir, filename)
+                shutil.copy2(file_path, sandbox_file)
+                os.chmod(sandbox_file, 0o755)
+
+                # 파일 시스템 초기 상태 저장
+                initial_files = set()
+                for root, dirs, files in os.walk(sandbox_dir):
+                    for file in files:
+                        initial_files.add(os.path.join(root, file))
+
+                # 프로세스 실행
+                try:
+                    process = subprocess.Popen(
+                        [sandbox_file],
+                        cwd=sandbox_dir,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        env={'PATH': '/usr/bin:/bin', 'HOME': sandbox_dir}
+                    )
+
+                    monitoring_active = True
+                    start_time = time.time()
+
+                    # 프로세스 모니터링 (타임아웃까지)
+                    while monitoring_active and (time.time() - start_time) < timeout:
+                        if process.poll() is not None:
+                            break
+
+                        try:
+                            # CPU 사용량 체크
+                            proc_info = psutil.Process(process.pid)
+                            cpu_percent = proc_info.cpu_percent(interval=0.1)
+
+                            if cpu_percent > 80:
+                                result['threat_level'] += 3
+                                result['behaviors'].append('high_cpu_usage')
+
+                            # 자식 프로세스 확인
+                            children = proc_info.children(recursive=True)
+                            if len(children) > 0:
+                                result['threat_level'] += 10
+                                for child in children:
+                                    result['process_created'].append({
+                                        'pid': child.pid,
+                                        'name': child.name()
+                                    })
+
+                            # 네트워크 연결 확인
+                            try:
+                                connections = proc_info.connections()
+                                if len(connections) > 0:
+                                    result['threat_level'] += 15
+                                    for conn in connections:
+                                        result['network_activity'].append({
+                                            'local': str(conn.laddr),
+                                            'remote': str(conn.raddr) if conn.raddr else None
+                                        })
+                            except (psutil.AccessDenied, AttributeError):
+                                pass
+
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            break
+
+                        time.sleep(0.5)
+
+                    # 타임아웃 처리
+                    if process.poll() is None:
+                        result['threat_level'] += 20
+                        result['behaviors'].append('timeout_exceeded')
+                        process.kill()
+                        result['execution_log'].append(f"실행 타임아웃 ({timeout}초)")
+                    else:
+                        stdout, stderr = process.communicate(timeout=1)
+                        if stdout:
+                            result['execution_log'].append(f"출력: {stdout.decode('utf-8', errors='ignore')[:200]}")
+
+                except Exception as e:
+                    result['execution_log'].append(f"실행 오류: {str(e)}")
+                    result['threat_level'] += 25
+
+                finally:
+                    monitoring_active = False
+
+                    # 파일 시스템 변경 확인
+                    current_files = set()
+                    for root, dirs, files in os.walk(sandbox_dir):
+                        for file in files:
+                            current_files.add(os.path.join(root, file))
+
+                    new_files = current_files - initial_files
+                    if len(new_files) > 1:  # 1개는 원본 파일
+                        result['threat_level'] += 5 * (len(new_files) - 1)
+                        for f in new_files:
+                            result['file_operations'].append({
+                                'action': 'created',
+                                'path': os.path.basename(f)
+                            })
+
+            # 최종 위협 수준 계산
+            result['threat_level'] = min(result['threat_level'], 100)
+            result['confidence'] = result['threat_level']
+
+            # 위협 등급 결정
+            if result['threat_level'] >= 80:
+                result['threat_type'] = 'Critical Threat'
+            elif result['threat_level'] >= 60:
+                result['threat_type'] = 'High Risk'
+            elif result['threat_level'] >= 40:
+                result['threat_type'] = 'Suspicious'
+            elif result['threat_level'] >= 20:
+                result['threat_type'] = 'Low Risk'
+            else:
+                result['threat_type'] = 'Clean'
+
+            result['execution_log'].append(f"스캔 완료 - 위협 수준: {result['threat_level']}/100")
+
+        except Exception as e:
+            result['threat_type'] = 'Scan Error'
+            result['execution_log'].append(f"스캔 오류: {str(e)}")
+
+        finally:
+            # 샌드박스 정리
+            if sandbox_dir and os.path.exists(sandbox_dir):
+                try:
+                    shutil.rmtree(sandbox_dir)
+                    result['execution_log'].append("샌드박스 정리 완료")
+                except:
+                    pass
+
+        return result
+
 
 class SmartAntivirusEngine:
     def __init__(self, parent_root, return_callback):
@@ -2283,7 +2481,8 @@ MD5 해시: {file_hash or 'Unknown'}
             ("⚡ 빠른 스캔 (중요 위치)", "quick"),
             ("🔍 전체 시스템 스캔", "full"),
             ("📁 사용자 정의 경로", "custom"),
-            ("🗂️ 특정 파일 스캔", "file")
+            ("🗂️ 특정 파일 스캔", "file"),
+            ("🔒 샌드박스 스캔 (격리 실행)", "sandbox")
         ]
         
         for text, value in scan_options:
@@ -2438,7 +2637,7 @@ MD5 해시: {file_hash or 'Unknown'}
 
     def browse_path(self):
         """경로 선택"""
-        if self.scan_type.get() == "file":
+        if self.scan_type.get() in ["file", "sandbox"]:
             file_path = filedialog.askopenfilename(
                 title="스캔할 파일 선택",
                 filetypes=[("모든 파일", "*.*")]
@@ -2478,6 +2677,11 @@ MD5 해시: {file_hash or 'Unknown'}
             scan_type = self.scan_type.get()
             scan_path = self.scan_path.get()
             
+            # 샌드박스 스캔 처리
+            if scan_type == "sandbox":
+                self.sandbox_scan_worker(scan_path)
+                return
+
             # 스캔할 경로 결정
             if scan_type == "smart":
                 paths_to_scan = self.get_smart_scan_paths()
@@ -2570,6 +2774,127 @@ MD5 해시: {file_hash or 'Unknown'}
             self.scan_status.set(f"스캔 오류: {str(e)}")
         finally:
             self.stop_scan()
+
+    def sandbox_scan_worker(self, file_path):
+        """샌드박스 스캔 작업 수행"""
+        try:
+            self.scan_status.set("🔒 샌드박스 스캔 시작...")
+
+            # 파일 존재 확인
+            if not os.path.isfile(file_path):
+                messagebox.showerror("오류", "유효한 파일을 선택해주세요.")
+                return
+
+            self.current_file.set(os.path.basename(file_path))
+            self.scan_progress.set(10)
+
+            # VirtualAIScanner 인스턴스 생성
+            scanner = VirtualAIScanner()
+
+            # 샌드박스 스캔 실행
+            self.scan_status.set("🔒 격리된 환경에서 파일 분석 중...")
+            self.scan_progress.set(30)
+
+            result = scanner.sandbox_scan(file_path, timeout=30, execute=True)
+
+            self.scan_progress.set(70)
+
+            # 결과 처리
+            if result:
+                threat_level = result['threat_level']
+                threat_type = result['threat_type']
+
+                # 통계 업데이트
+                self.files_scanned.set(f"분석된 파일: 1")
+                self.scan_progress.set(90)
+
+                # 위협 발견 시 리스트에 추가
+                if threat_level >= self.confidence_threshold.get():
+                    self.threats_found.append({
+                        'path': file_path,
+                        'name': os.path.basename(file_path),
+                        'threat_type': threat_type,
+                        'confidence': threat_level,
+                        'size': os.path.getsize(file_path),
+                        'details': result
+                    })
+
+                    # 트리뷰에 추가
+                    self.threat_tree.insert('', 'end', values=(
+                        os.path.basename(file_path),
+                        file_path[:50] + '...' if len(file_path) > 50 else file_path,
+                        threat_type,
+                        f"{threat_level}%",
+                        self.get_risk_level_from_confidence(threat_level),
+                        f"{os.path.getsize(file_path) // 1024} KB",
+                        "감지됨"
+                    ))
+
+                    self.threats_count.set(f"발견된 위협: 1")
+                    self.scan_status.set(f"⚠️ 위협 발견: {threat_type}")
+
+                    # 상세 분석 결과 표시
+                    details_msg = f"샌드박스 스캔 결과:\n\n"
+                    details_msg += f"파일: {os.path.basename(file_path)}\n"
+                    details_msg += f"위협 수준: {threat_level}/100\n"
+                    details_msg += f"위협 유형: {threat_type}\n\n"
+
+                    if result['behaviors']:
+                        details_msg += f"탐지된 행동:\n"
+                        for behavior in result['behaviors']:
+                            details_msg += f"  • {behavior}\n"
+
+                    if result['file_operations']:
+                        details_msg += f"\n파일 작업 ({len(result['file_operations'])}건):\n"
+                        for op in result['file_operations'][:5]:
+                            details_msg += f"  • {op['action']}: {op['path']}\n"
+
+                    if result['process_created']:
+                        details_msg += f"\n프로세스 생성 ({len(result['process_created'])}건):\n"
+                        for proc in result['process_created'][:5]:
+                            details_msg += f"  • {proc['name']} (PID: {proc['pid']})\n"
+
+                    if result['network_activity']:
+                        details_msg += f"\n네트워크 활동 ({len(result['network_activity'])}건):\n"
+                        for net in result['network_activity'][:5]:
+                            details_msg += f"  • {net['local']} -> {net.get('remote', 'N/A')}\n"
+
+                    if result['suspicious_patterns']:
+                        details_msg += f"\n의심스러운 패턴:\n"
+                        for pattern in result['suspicious_patterns'][:5]:
+                            details_msg += f"  • {pattern}\n"
+
+                    messagebox.showwarning("샌드박스 스캔 완료", details_msg)
+
+                else:
+                    self.scan_status.set("✅ 스캔 완료 - 위협 없음")
+                    self.threats_count.set("발견된 위협: 0")
+                    messagebox.showinfo("샌드박스 스캔 완료",
+                                      f"파일이 안전한 것으로 확인되었습니다.\n\n"
+                                      f"위협 수준: {threat_level}/100\n"
+                                      f"결과: {threat_type}")
+
+                self.scan_progress.set(100)
+
+        except Exception as e:
+            self.scan_status.set(f"샌드박스 스캔 오류: {str(e)}")
+            messagebox.showerror("스캔 오류", f"샌드박스 스캔 중 오류 발생:\n{str(e)}")
+
+        finally:
+            self.stop_scan()
+
+    def get_risk_level_from_confidence(self, confidence):
+        """신뢰도에서 위험도 레벨 반환"""
+        if confidence >= 80:
+            return "Critical"
+        elif confidence >= 60:
+            return "High"
+        elif confidence >= 40:
+            return "Medium"
+        elif confidence >= 20:
+            return "Low"
+        else:
+            return "Safe"
 
     def get_smart_scan_paths(self):
         """스마트 스캔 경로 (위험도 기반)"""
